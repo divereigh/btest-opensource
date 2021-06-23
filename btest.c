@@ -53,6 +53,7 @@ struct statStruct {
 	unsigned long recvBytes;
 	unsigned long maxInterval; // In us, Not sent over the wire
 	unsigned long minInterval; // In us, Not sent over the wire
+	signed long sentPackets; // Based on sequence number
 	signed long lostPackets; // Not sent over the wire
 };
 
@@ -86,7 +87,7 @@ unsigned char *calc_md5auth(unsigned char *nonce, char *passwd);
 char *opt_bandwidth=NULL;
 int opt_udpmode=0;
 int opt_server=0;
-int opt_interval=0;
+int opt_interval=1;
 int opt_nat=0;
 int opt_transmit=0;
 int opt_receive=0;
@@ -149,6 +150,9 @@ int main(int argc, char **argv){
 			break;
 		case 'i':
 			opt_interval=atoi(optarg);
+			if (opt_interval <= 1) {
+				opt_interval=1;
+			}
 			break;
 		case 'b':
 			opt_bandwidth=strdup(optarg);
@@ -198,6 +202,7 @@ void usage_long() {
 	                           "  -t, --transmit 			transmit data\n"
 	                           "  -r, --receive 			receive data\n"
 	                           "  -u, --udp                 use UDP\n"
+	                           "  -n, --nat                 use NAT mode for UDP recieve, send a packet to open up the NAT\n"
 	                           "  -b, --bandwidth #[KMG][/#] target bandwidth in bits/sec (0 for unlimited)\n"
 	                           "                            (default %d Mbit/sec for UDP, unlimited for TCP)\n"
 	                           "                            (optional slash and packet count for burst mode)\n"
@@ -535,10 +540,11 @@ struct statStruct unpackStatStr(unsigned char *buf) {
 
 	unpackLongLE(&buf[8], &stat.recvBytes);
 
-	/* These three are not used */
+	/* These four are not used */
 	stat.maxInterval=0;
 	stat.minInterval=0;
 	stat.lostPackets=0;
+	stat.sentPackets=0;
 	return(stat);
 }
 
@@ -547,7 +553,7 @@ void printStatStruct(char *msg, struct statStruct *pstat) {
 	double bitRate;
 	char bitRateStr[20];
 
-	bitRate=pstat->recvBytes*8;
+	bitRate=pstat->recvBytes*8/opt_interval;
 	if (bitRate > 10000000) {
 		sprintf(bitRateStr, "%.1fMb/s", bitRate/1000000);
 	} else {
@@ -559,8 +565,10 @@ void printStatStruct(char *msg, struct statStruct *pstat) {
 		bitRateStr
 	);
 	if (pstat->maxInterval>0) {
-		printf(", Lost: %ld, Min: %.4lfms, Max: %.4lfms, Diff %0.4lfms\n",
+		printf(", Lost: %ld/%ld (%.2lf%%), Min: %.4lfms, Max: %.4lfms, Diff %0.4lfms\n",
 			pstat->lostPackets,
+			pstat->sentPackets,
+			pstat->sentPackets ? ((double) 100 * pstat->lostPackets)/pstat->sentPackets : (double) 0,
 			((double) pstat->minInterval)/1000,
 			((double) pstat->maxInterval)/1000,
 			((double) pstat->maxInterval)/1000 - ((double) pstat->minInterval)/1000
@@ -681,6 +689,7 @@ void *test_udp_rx(void *arg) {
 	recvStats.maxInterval=0;
 	recvStats.minInterval=0;
 	recvStats.lostPackets=0;
+	recvStats.sentPackets=0;
 	pcmd = (struct cmdStruct *)arg;
 	// printf("Calling test_udp_rx(tx_size=%d)\n", pcmd->tx_size);
 	buf=(unsigned char *) malloc(pcmd->tx_size);
@@ -710,6 +719,7 @@ void *test_udp_rx(void *arg) {
 */
 				recvStats.lostPackets += thisSeq-lastSeq-1;
 			}
+			recvStats.sentPackets += thisSeq-lastSeq;
 
 			if (last.tv_sec!=0 && last.tv_nsec!=0) {
 				/* Work out time difference */
@@ -817,7 +827,7 @@ int test_udp(struct cmdStruct cmd, int cmdsock, char *remoteIP) {
 
 	/* Interval between status messages */
 	interval.tv_nsec=0;
-	interval.tv_sec=1;
+	interval.tv_sec=(opt_interval >= 1) ? opt_interval : 1;
 
 	/* Get current time and add the interval to it */
 	clock_gettime(CLOCK_REALTIME, &nextStatusTime);
@@ -836,13 +846,14 @@ int test_udp(struct cmdStruct cmd, int cmdsock, char *remoteIP) {
 		if (ready) {
 			nBytes=recv(cmdsock,buffer,1024,0);
 			if (nBytes<=0) {
+				printf("No bytes received: %d\n", nBytes);
 				exit(0);
 			}
 			remoteStats=unpackStatStr(buffer);
 			if (((cmd.direction & CMD_DIR_TX) && opt_server) || ((cmd.direction & CMD_DIR_RX) && !opt_server)) {
 				/* Only print this if we are transmitting */
 				if (opt_display) {
-        				double bitRate=remoteStats.recvBytes*8;
+        				double bitRate=remoteStats.recvBytes*8/opt_interval;
         				if (bitRate > 10000000) {
                 				printf("%.1f Mb/s\n", bitRate/1000000);
         				} else {
@@ -854,7 +865,7 @@ int test_udp(struct cmdStruct cmd, int cmdsock, char *remoteIP) {
 
 				fflush(stdout);
 				/* Set the outgoing speed to be twice the rate reported */
-				new_tx_speed=remoteStats.recvBytes*8;
+				new_tx_speed=remoteStats.recvBytes*8/opt_interval;
 				new_tx_speed *= 1.5;
 				tx_speed_changed=1;
 			}
@@ -867,7 +878,7 @@ int test_udp(struct cmdStruct cmd, int cmdsock, char *remoteIP) {
 			if (((cmd.direction & CMD_DIR_RX) && opt_server) || ((cmd.direction & CMD_DIR_TX) && !opt_server)) {
 				/* Only print this if we are recieving */
 				if (opt_display) {
-        				double bitRate=recvStats.recvBytes*8;
+        				double bitRate=recvStats.recvBytes*8/opt_interval;
         				if (bitRate > 10000000) {
                 				printf("%.1f Mb/s\n", bitRate/1000000);
         				} else {
@@ -885,6 +896,7 @@ int test_udp(struct cmdStruct cmd, int cmdsock, char *remoteIP) {
 			recvStats.maxInterval=0;
 			recvStats.minInterval=0;
 			recvStats.lostPackets=0;
+			recvStats.sentPackets=0;
 		}
 	}
 }
